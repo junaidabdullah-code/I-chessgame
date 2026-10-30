@@ -4499,6 +4499,29 @@ function renderApp() {
   function prettyReason(reason) {
     return String(reason || '').split('-').join(' ');
   }
+
+  /* The server reports the winner as 'white' | 'black' | 'draw', while a
+   * player's seat is 'w' | 'b'. Comparing those two strings directly is what
+   * made every decisive game - AI wins included - announce itself as a loss.
+   * Everything that labels an outcome goes through the helpers below. */
+  function winnerSeat(result) {
+    var r = String(result || '').toLowerCase();
+    if (r === 'white' || r === 'w') return 'w';
+    if (r === 'black' || r === 'b') return 'b';
+    return null; /* draw, unfinished or unknown */
+  }
+  function outcomeFor(state) {
+    if (!state) return 'draw';
+    var winner = winnerSeat(state.result);
+    if (!winner) return 'draw';
+    var seat = state.you || state.color || null;
+    if (!seat) return 'draw'; /* spectators never reach the result banner */
+    return winner === seat ? 'win' : 'loss';
+  }
+  function outcomeLabel(state) {
+    var o = outcomeFor(state);
+    return o === 'win' ? 'You won' : o === 'loss' ? 'You lost' : 'Draw';
+  }
   function toast(title, body, kind) {
     var box = $('toasts');
     if (!box) return;
@@ -5198,7 +5221,7 @@ function renderApp() {
       return;
     }
     box.innerHTML = games.map(function (g) {
-      var outcome = g.result === 'draw' ? 'draw' : g.result === g.you ? 'win' : 'loss';
+      var outcome = outcomeFor(g);
       var label = outcome === 'win' ? 'Win' : outcome === 'loss' ? 'Loss' : 'Draw';
       var deltaCls = g.ratingDelta > 0 ? 'delta-pos' : g.ratingDelta < 0 ? 'delta-neg' : 'delta-zero';
       var deltaText = (g.ratingDelta > 0 ? '+' : '') + (g.ratingDelta || 0);
@@ -5564,7 +5587,7 @@ function renderApp() {
       } else {
         var winnerName = g.result === 'white' ? g.players.w.username : g.players.b.username;
         text = winnerName + ' wins by ' + prettyReason(g.resultReason);
-        if (g.result === g.you) status.className = 'status win';
+        if (outcomeFor(g) === 'win') status.className = 'status win';
       }
     } else if (S.spectating) {
       text = 'Watching · ' + (g.turn === 'w' ? 'White' : 'Black') + ' to move' + (g.inCheck ? ' — check!' : '');
@@ -5647,13 +5670,14 @@ function renderApp() {
   }
 
   function showResult(state, delta, summary) {
-    var title = state.result === 'draw' ? 'Draw' : state.result === state.you ? 'You won' : 'You lost';
+    var outcome = outcomeFor(state);
+    var title = outcomeLabel(state);
     var reason = prettyReason(state.resultReason);
     var sign = delta > 0 ? '+' : '';
     var deltaText = state.rated ? (sign + delta + ' rating') : 'Practice game · rating unchanged';
     var mine = state.capturePoints[state.you] || 0;
     var theirs = state.capturePoints[state.you === 'w' ? 'b' : 'w'] || 0;
-    var extra = state.result === 'draw'
+    var extra = outcome === 'draw'
       ? 'No points are transferred on a draw.'
       : 'Captures: you ' + mine + ' · opponent ' + theirs;
 
