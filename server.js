@@ -51,6 +51,12 @@ try {
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
+/* Public origin used in logs and any absolute link we ever emit. Set
+ * PRODUCTION_URL (or APP_URL / PUBLIC_URL) on the host; the app itself always
+ * works with relative URLs, so an unset value is not fatal. */
+const PUBLIC_URL = String(process.env.PRODUCTION_URL || process.env.APP_URL || process.env.PUBLIC_URL || '')
+  .trim()
+  .replace(/\/+$/, '');
 const MONGO_URI = (process.env.MONGO_URI || '').trim();
 const DB_NAME = process.env.MONGO_DB_NAME || 'chessgame';
 
@@ -107,6 +113,9 @@ function log(...args) {
 function logError(context, err) {
   const safe = err && err.message ? err.message : String(err);
   console.error(`[${new Date().toISOString()}] [error] ${context}: ${safe}`);
+}
+function warn(message) {
+  console.warn(`[${new Date().toISOString()}] [warn] ${message}`);
 }
 
 /* ---------------------------------------------------------------------------
@@ -590,6 +599,32 @@ const Game = mongoose.model('Game', gameSchema);
 const Invitation = mongoose.model('Invitation', invitationSchema);
 const RatingHistory = mongoose.model('RatingHistory', ratingHistorySchema);
 const Notification = mongoose.model('Notification', notificationSchema);
+
+/**
+ * Cookie-independent session token.
+ *
+ * Some production setups cannot use cookies at all: plain-HTTP deployments
+ * where the browser rejects `Secure` cookies, embedded/third-party frames,
+ * Safari "block all cookies", or users who clear cookies between requests.
+ * In those environments the cookie session is silently dropped and a player
+ * who just signed up bounces straight back to the sign-in screen.
+ *
+ * So every sign-in also issues a bearer token (kept in localStorage by the
+ * browser and sent as `x-gm-token` / `auth.token` on the socket). Only the
+ * SHA-256 hash is stored, the raw token never touches the database, and the
+ * record expires with the session TTL via a TTL index.
+ */
+const sessionTokenSchema = new mongoose.Schema(
+  {
+    tokenHash: { type: String, required: true, unique: true },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    userAgent: { type: String, default: '', maxlength: 200 },
+    createdAt: { type: Date, default: () => new Date(), expires: 0 },
+  },
+  { versionKey: false }
+);
+sessionTokenSchema.index({ user: 1, createdAt: -1 });
+const SessionToken = mongoose.model('SessionToken', sessionTokenSchema);
 
 /* ---------------------------------------------------------------------------
  * SECTION 4 — SHARED HELPERS (validation, chess, ratings)
@@ -1150,8 +1185,20 @@ const server = http.createServer(app);
 /** @type {import('socket.io').Server|null} */
 let io = null;
 
-/* Needed behind Render/Heroku/Nginx so secure cookies and req.ip work. */
-if (String(process.env.TRUST_PROXY || 'false') === 'true') app.set('trust proxy', 1);
+/* Needed behind Render/Heroku/Nginx/Vercel so req.secure and req.ip are right,
+ * which in turn decides whether the session cookie may carry the Secure flag.
+ * TRUST_PROXY accepts true | false | <number of hops> | loopback | linklocal |
+ * uniquelocal. Default: one hop in production (the usual single reverse proxy),
+ * none in development. */
+const TRUST_PROXY_RAW = String(process.env.TRUST_PROXY || '').trim().toLowerCase();
+const TRUST_PROXY_VALUE = (() => {
+  if (!TRUST_PROXY_RAW) return IS_PROD ? 1 : false;
+  if (TRUST_PROXY_RAW === 'false' || TRUST_PROXY_RAW === '0' || TRUST_PROXY_RAW === 'no') return false;
+  if (TRUST_PROXY_RAW === 'true' || TRUST_PROXY_RAW === 'yes') return 1;
+  if (/^\d+$/.test(TRUST_PROXY_RAW)) return Number(TRUST_PROXY_RAW);
+  return TRUST_PROXY_RAW; // 'loopback', 'linklocal', 'uniquelocal' or a csv of subnets
+})();
+if (TRUST_PROXY_VALUE !== false) app.set('trust proxy', TRUST_PROXY_VALUE);
 
 app.disable('x-powered-by');
 
@@ -1276,6 +1323,34 @@ function createMongoSessionStore(connectionUri) {
   });
 }
 
+/**
+ * Cookie security. A `Secure` cookie is silently discarded by the browser when
+ * the page is served over plain HTTP, which used to leave freshly registered
+ * players stuck on the sign-in screen in production. `'auto'` lets
+ * express-session decide per request (Secure only when the request is HTTPS),
+ * and COOKIE_SECURE=true|false pins it explicitly.
+ */
+const COOKIE_SECURE = (() => {
+  const raw = String(process.env.COOKIE_SECURE || '').trim().toLowerCase();
+  if (raw === 'true' || raw === 'always') return true;
+  if (raw === 'false' || raw === 'never') return false;
+  return 'auto';
+})();
+
+/* SameSite policy. 'lax' (default) survives normal navigation, OAuth-style
+ * returns and iframe-free hosting. 'none' is only meaningful together with
+ * Secure, so it forces Secure on. */
+const COOKIE_SAME_SITE = (() => {
+  const raw = String(process.env.COOKIE_SAMESITE || '').trim().toLowerCase();
+  if (raw === 'strict') return 'strict';
+  if (raw === 'none') return 'none';
+  return 'lax';
+})();
+
+/* Optional cookie domain for sub-domain deployments (e.g. .example.com).
+ * Left empty the cookie is host-only, which is what most hosts need. */
+const COOKIE_DOMAIN = String(process.env.COOKIE_DOMAIN || '').trim() || undefined;
+
 const sessionMiddleware = session({
   name: 'grandmaster.sid',
   secret: SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
@@ -1285,13 +1360,48 @@ const sessionMiddleware = session({
   store: sessionStore,
   cookie: {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: IS_PROD,
+    sameSite: COOKIE_SAME_SITE,
+    /* 'none' without Secure is rejected by every modern browser. */
+    secure: COOKIE_SAME_SITE === 'none' ? true : COOKIE_SECURE,
+    ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
     maxAge: SESSION_TTL_MS,
     path: '/',
   },
 });
+/** Wrap async route handlers so rejections reach the error middleware. */
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 app.use(sessionMiddleware);
+
+/**
+ * Cookie fallback. If the browser dropped the session cookie (Secure cookie on
+ * plain HTTP, blocked third-party cookies, cleared storage), the request still
+ * carries a bearer token. We rebuild the session from it so the app behaves
+ * identically with or without cookies.
+ */
+app.use(
+  wrap(async (req, res, next) => {
+    const header = req.get('x-gm-token');
+    const bearer = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
+    const raw = cleanString(header || (bearer ? bearer[1] : ''), 200);
+    if (!raw) return next();
+
+    /* Always make sure the browser also gets a cookie again, so the next request
+     * works even if it stops sending the header (e.g. after a form post). */
+    if (req.session && req.session.userId) return next();
+
+    const userId = await resolveSessionToken(raw);
+    if (!userId) return next();
+    const user = await User.findById(userId).select('username').lean();
+    if (!user) return next();
+    if (!req.session) return next();
+    req.session.userId = userId;
+    req.session.tokenAuth = true;
+    req.session.tokenHash = hashSessionToken(raw);
+    req.session.createdAt = req.session.createdAt || Date.now();
+    return next();
+  })
+);
 
 /* ---- Rate limiters ----
  * DISABLE_RATE_LIMITS=true is honoured only outside production so an automated
@@ -1334,12 +1444,84 @@ function requireAuth(req, res, next) {
   next();
 }
 function requireGuest(req, res, next) {
-  if (req.session && req.session.userId) return res.status(400).json({ error: 'You are already signed in.', code: 'already_authenticated' });
+  /* A cookie-less fallback session must not lock the user out of the forms —
+   * they are precisely the people who may need to sign in again. */
+  if (req.session && req.session.userId && !req.session.tokenAuth) {
+    return res.status(400).json({ error: 'You are already signed in.', code: 'already_authenticated' });
+  }
   next();
 }
 
-/** Wrap async route handlers so rejections reach the error middleware. */
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+/** SHA-256 of a bearer token — the only form ever written to MongoDB. */
+function hashSessionToken(raw) {
+  return crypto.createHash('sha256').update(String(raw)).digest('hex');
+}
+
+/**
+ * Issue a new bearer token for a user. Returns the raw token exactly once.
+ * Old tokens for the same user are pruned so a stolen-but-unused token cannot
+ * pile up (keep the 12 most recent devices/sessions).
+ */
+async function issueSessionToken(userId, req) {
+  const raw = crypto.randomBytes(32).toString('base64url');
+  const ua = cleanString(req?.get?.('user-agent') || '', 200);
+  try {
+    await SessionToken.create({ tokenHash: hashSessionToken(raw), user: userId, userAgent: ua });
+    const stale = await SessionToken.find({ user: userId })
+      .sort({ createdAt: -1 })
+      .skip(12)
+      .select('_id')
+      .lean();
+    if (stale.length) await SessionToken.deleteMany({ _id: { $in: stale.map((row) => row._id) } });
+  } catch (err) {
+    /* A token is a convenience fallback: never block a successful sign-in. */
+    logError('issueSessionToken', err);
+    return null;
+  }
+  return raw;
+}
+
+/** Resolve a raw bearer token to a live user id, or null. */
+async function resolveSessionToken(raw, cache) {
+  if (typeof raw !== 'string' || raw.length < 20 || raw.length > 200) return null;
+  const tokenHash = hashSessionToken(raw);
+  const box = cache || tokenCache;
+  const hit = box.get(tokenHash);
+  if (hit && hit.expiresAt > Date.now()) return hit.userId;
+  let row = null;
+  try {
+    row = await SessionToken.findOne({ tokenHash }).select('user createdAt').lean();
+  } catch (err) {
+    if (!(err && err.code === 11000)) logError('resolveSessionToken', err);
+    return null;
+  }
+  if (!row) return null;
+  const age = Date.now() - new Date(row.createdAt).getTime();
+  if (age > SESSION_TTL_MS) {
+    SessionToken.deleteOne({ _id: row._id }).catch(() => {});
+    return null;
+  }
+  const entry = { userId: String(row.user), expiresAt: Date.now() + 30_000 };
+  box.set(tokenHash, entry);
+  if (box.size > 5000) box.clear();
+  return entry.userId;
+}
+
+/** Small in-process cache so the fallback costs one query per 30 s per token. */
+const tokenCache = new Map();
+
+/** Forget every token belonging to a user (sign-out). */
+async function revokeSessionTokens(userId, keepRaw) {
+  try {
+    const query = { user: userId };
+    if (keepRaw) query.tokenHash = { $ne: hashSessionToken(keepRaw) };
+    await SessionToken.deleteMany(query);
+  } catch (err) {
+    logError('revokeSessionTokens', err);
+  }
+  tokenCache.clear();
+}
 
 /** Regenerate the session id (prevents session fixation) and store the user id. */
 function establishSession(req, userId) {
@@ -2385,7 +2567,9 @@ api.post(
 
     await establishSession(req, user._id);
     await setOnline(user._id, true);
-    res.status(201).json({ ok: true, user: user.toPublicJSON(), config: clientConfig() });
+    /* The token makes the response usable even if the browser refuses the cookie. */
+    const token = await issueSessionToken(user._id, req);
+    res.status(201).json({ ok: true, user: user.toPublicJSON(), config: clientConfig(), token });
   })
 );
 
@@ -2411,7 +2595,14 @@ api.post(
     setOnline(user._id, true).catch(() => {});
 
     /* If a previous session was left mid-game the client can resume it. */
-    res.json({ ok: true, user: user.toPublicJSON(), activeGameId: user.currentGameId ? String(user.currentGameId) : null, config: clientConfig() });
+    const token = await issueSessionToken(user._id, req);
+    res.json({
+      ok: true,
+      user: user.toPublicJSON(),
+      activeGameId: user.currentGameId ? String(user.currentGameId) : null,
+      config: clientConfig(),
+      token,
+    });
   })
 );
 
@@ -2424,8 +2615,14 @@ api.post(
        * player explicitly resigns; logging out just frees the seat for resume. */
       await User.updateOne({ _id: userId }, { $set: { lastActive: new Date() } }).catch(() => {});
     }
+    const tokenHash = req.session?.tokenHash;
     req.session.destroy(() => {
       res.clearCookie('grandmaster.sid', { path: '/' });
+      if (tokenHash) {
+        SessionToken.deleteOne({ tokenHash })
+          .catch(() => {})
+          .then(() => tokenCache.clear());
+      }
       res.json({ ok: true });
     });
   })
@@ -2976,6 +3173,12 @@ app.get('/api/pieces/:color/:type.svg', (req, res) => {
   res.type('image/svg+xml').set('Cache-Control', 'public, max-age=604800, immutable').send(svg);
 });
 
+/* Unknown /api/* paths answer with JSON 404 (never the HTML shell, never a
+ * misleading 401 from the auth guard). Registered last so every real route wins. */
+api.use((req, res) => {
+  res.status(404).json({ error: `Endpoint ${req.method} ${req.originalUrl} not found.`, code: 'not_found' });
+});
+
 app.use('/api', api);
 
 /* ---- Health probe (no auth, no secrets) ---- */
@@ -3005,8 +3208,23 @@ io.engine.use(sessionMiddleware);
 io.use(
   wrap(async (socket, next) => {
     const sess = socket.request.session;
-    if (!sess || !sess.userId) return next(new Error('unauthenticated'));
-    const user = await User.findById(sess.userId).select('username rating currentGameId');
+    let userId = sess && sess.userId ? String(sess.userId) : null;
+
+    /* Cookie-less clients authenticate the socket with the same bearer token
+     * they use for HTTP (handshake `auth.token` or an `x-gm-token` header). */
+    if (!userId) {
+      const handshake = socket.handshake || {};
+      const raw = cleanString(
+        (handshake.auth && (handshake.auth.token || handshake.auth['x-gm-token'])) ||
+          (handshake.headers && handshake.headers['x-gm-token']) ||
+          '',
+        200
+      );
+      if (raw) userId = await resolveSessionToken(raw);
+    }
+    if (!userId) return next(new Error('unauthenticated'));
+
+    const user = await User.findById(userId).select('username rating currentGameId');
     if (!user) return next(new Error('unauthenticated'));
     socket.data.userId = String(user._id);
     socket.data.username = user.username;
@@ -3348,83 +3566,90 @@ for (const t of [invitationSweeper, gameSweeper, presenceJanitor, clockSweeper])
  * Served straight from this file. No other application source files exist.
  * ------------------------------------------------------------------------- */
 
-const APP_CSS = `
-:root{
-  color-scheme:dark;
-  --bg:#060f1a; --bg-2:#0a1c20; --panel:#0b1d1d; --panel-2:#102b27; --panel-3:#13332d;
-  --line:#22453e; --line-soft:#1a3630; --gold:#c6a45c; --gold-bright:#e7cd92; --gold-dim:#8a7440;
-  --emerald:#2f8f6f; --emerald-bright:#4fc39a; --teal:#39b9ab;
-  --ivory:#f4ebdd; --muted:#9fb3ab; --muted-2:#7d918b; --danger:#e2685d; --danger-soft:#43221f;
-  --sq-light:#e8d6a3; --sq-dark:#285b4a;
-  --radius:14px; --radius-sm:9px;
-  --shadow-lg:0 30px 70px rgba(0,0,0,.45); --shadow-md:0 12px 30px rgba(0,0,0,.3);
+const APP_CSS = `:root{
+  color-scheme:light;
+  --bg:#f1f6f5; --bg-2:#e8f1ef;
+  --panel:#ffffff; --panel-2:#f6faf9; --panel-3:#eaf3f1;
+  --surface:#ffffff; --surface-2:#f4f8f7; --surface-3:#e3efec;
+  --line:#d9e7e4; --line-soft:#e6f0ee; --line-strong:#bcd6d1;
+  --ink:#0d2b29; --ink-2:#2c514e; --ivory:#0d2b29;
+  --muted:#5d7d7a; --muted-2:#7f9c99;
+  --teal:#008080; --teal-strong:#006b6b; --teal-deep:#005858;
+  --teal-soft:#d9f0ee; --teal-soft-2:#eef8f7; --teal-line:#a8d8d3;
+  --gold:#0b6b69; --gold-bright:#00605f; --gold-dim:#8ab8b3;
+  --emerald:#008080; --emerald-bright:#0a9a92;
+  --danger:#c23b2b; --danger-soft:#fdecea; --danger-line:#e8b4ac;
+  --warn:#8a6a12; --warn-soft:#fdf4dd; --warn-line:#e6d09a;
+  --sq-light:#eef4f2; --sq-dark:#5b9d95;
+  --radius:0; --radius-sm:0;
+  --shadow-lg:none; --shadow-md:none; --shadow-sm:none;
   --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
   --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{margin:0;padding:0;min-height:100%}
 body{
-  background:
-    radial-gradient(1100px 700px at 12% -10%, rgba(47,143,111,.20), transparent 60%),
-    radial-gradient(900px 600px at 92% 8%, rgba(198,164,92,.12), transparent 62%),
-    linear-gradient(180deg,#081724 0%,var(--bg) 55%,#050d15 100%);
-  background-attachment:fixed;
-  color:var(--ivory); font:15px/1.5 var(--sans); -webkit-font-smoothing:antialiased;
+  background:var(--bg);
+  color:var(--ink); font:15px/1.55 var(--sans); -webkit-font-smoothing:antialiased;
 }
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
-button:disabled{cursor:not-allowed;opacity:.45}
-a{color:var(--gold-bright)}
-h1,h2,h3,h4{font-family:var(--serif);font-weight:600;letter-spacing:.01em;margin:0}
+button:disabled{cursor:not-allowed;opacity:.5}
+a{color:var(--teal-strong);text-decoration:none;border-bottom:1px solid var(--teal-line)}
+a:hover{border-bottom-color:var(--teal)}
+h1,h2,h3,h4{font-family:var(--sans);font-weight:650;letter-spacing:-.01em;margin:0;color:var(--ink)}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#23443c;border-radius:8px;border:2px solid transparent;background-clip:content-box}
-::selection{background:rgba(198,164,92,.35)}
-.view{animation:fade .28s ease both}
-.splash{min-height:100dvh;display:grid;place-items:center}
-@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+::-webkit-scrollbar-thumb{background:#c6dad6;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#aac7c1}
+::selection{background:var(--teal-soft);color:var(--teal-deep)}
+.view{animation:fade .2s ease both}
+.splash{min-height:100dvh;display:grid;place-items:center;background:var(--bg)}
+@keyframes fade{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){*{animation-duration:.001s!important;transition-duration:.001s!important}}
 
 /* ---------- shared primitives ---------- */
 .btn{
-  border:1px solid var(--gold-dim); background:linear-gradient(180deg,#164036,#10322b);
-  color:#f3e3bb; border-radius:var(--radius-sm); padding:10px 15px; font-weight:600; font-size:13.5px;
-  transition:background .18s,border-color .18s,transform .12s,box-shadow .18s;
+  border:1px solid var(--teal); background:var(--teal);
+  color:#ffffff; border-radius:0; padding:10px 16px; font-weight:600; font-size:13.5px;
+  transition:background .14s,border-color .14s,color .14s;
   display:inline-flex; align-items:center; justify-content:center; gap:8px; white-space:nowrap;
 }
-.btn:hover:not(:disabled){background:linear-gradient(180deg,#1d574a,#154036);border-color:var(--gold);transform:translateY(-1px);box-shadow:0 6px 18px rgba(0,0,0,.3)}
-.btn:active:not(:disabled){transform:translateY(0)}
-.btn:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible,.square:focus-visible{outline:2px solid var(--gold-bright);outline-offset:2px}
-.btn.primary{background:linear-gradient(180deg,#d8bd78,#b0903f);border-color:#e7cd92;color:#241a06;text-shadow:0 1px 0 rgba(255,255,255,.25)}
-.btn.primary:hover:not(:disabled){background:linear-gradient(180deg,#ecd694,#c2a04b)}
-.btn.emerald{background:linear-gradient(180deg,#2f8f6f,#1e6550);border-color:#59c39c;color:#eafff5}
-.btn.emerald:hover:not(:disabled){background:linear-gradient(180deg,#3aa982,#237a60)}
-.btn.ghost{background:transparent;border-color:var(--line);color:var(--muted)}
-.btn.ghost:hover:not(:disabled){background:rgba(255,255,255,.05);color:var(--ivory);border-color:var(--gold-dim)}
-.btn.danger{background:linear-gradient(180deg,#8d3a31,#6d2a23);border-color:#c96a5c;color:#ffe9e4}
-.btn.danger:hover:not(:disabled){background:linear-gradient(180deg,#a34238,#7d3129)}
-.btn.sm{padding:7px 11px;font-size:12.5px;border-radius:8px}
+.btn:hover:not(:disabled){background:var(--teal-strong);border-color:var(--teal-strong)}
+.btn:active:not(:disabled){background:var(--teal-deep);border-color:var(--teal-deep)}
+.btn:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible,.square:focus-visible,.btn.ghost:focus-visible{
+  outline:2px solid var(--teal);outline-offset:2px;
+}
+.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff}
+.btn.primary:hover:not(:disabled){background:var(--teal-strong);border-color:var(--teal-strong)}
+.btn.emerald{background:var(--teal-strong);border-color:var(--teal-strong);color:#fff}
+.btn.emerald:hover:not(:disabled){background:var(--teal-deep);border-color:var(--teal-deep)}
+.btn.ghost{background:#fff;border-color:var(--line-strong);color:var(--ink-2)}
+.btn.ghost:hover:not(:disabled){background:var(--teal-soft-2);border-color:var(--teal);color:var(--teal-deep)}
+.btn.danger{background:#fff;border-color:var(--danger-line);color:var(--danger)}
+.btn.danger:hover:not(:disabled){background:var(--danger-soft);border-color:var(--danger);color:#a02c1e}
+.btn.sm{padding:7px 12px;font-size:12.5px}
 .btn.block{width:100%}
 .btn.icon{padding:9px;min-width:38px}
 .card{
-  background:linear-gradient(180deg,rgba(19,51,45,.72),rgba(9,26,26,.86));
-  border:1px solid var(--line); border-radius:var(--radius); padding:16px 17px;
-  box-shadow:var(--shadow-md); backdrop-filter:blur(2px);
+  background:var(--surface);
+  border:1px solid var(--line); border-radius:0; padding:16px 17px;
 }
-.card h3{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--gold);margin-bottom:12px;display:flex;align-items:center;gap:8px;justify-content:space-between}
-.card h3 .hint{font:11px/1.3 var(--sans);letter-spacing:0;text-transform:none;color:var(--muted-2)}
-.empty{color:var(--muted-2);font-size:12.5px;font-style:italic;padding:8px 0}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--line);color:var(--muted)}
-.pill.gold{border-color:var(--gold-dim);color:var(--gold-bright);background:rgba(198,164,92,.1)}
-.pill.live{border-color:#3f8f74;color:#8de3bd;background:rgba(63,143,116,.15)}
-.pill.off{border-color:#3a3a3a;color:#8a8a8a}
-.pill.win{border-color:#3f8f74;color:#8de3bd;background:rgba(63,143,116,.15)}
-.pill.loss{border-color:#8f4a42;color:#f0a79c;background:rgba(143,74,66,.15)}
-.pill.draw{border-color:#6a6a86;color:#c3c3e0;background:rgba(106,106,134,.15)}
-.dot{width:7px;height:7px;border-radius:50%;background:#3fb98a;box-shadow:0 0 0 3px rgba(63,185,138,.18);flex:none}
-.dot.busy{background:var(--gold)}
-.dot.off{background:#5a6660;box-shadow:none}
+.card h3{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--teal-strong);margin-bottom:12px;display:flex;align-items:center;gap:8px;justify-content:space-between;font-weight:700}
+.card h3 .hint{font:11px/1.3 var(--sans);letter-spacing:0;text-transform:none;color:var(--muted-2);font-weight:500}
+.empty{color:var(--muted-2);font-size:12.5px;padding:10px 0;border:1px dashed var(--line);text-align:center;background:var(--surface-2)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:0;font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;border:1px solid var(--line-strong);color:var(--muted);background:#fff}
+.pill.gold{border-color:var(--teal-line);color:var(--teal-strong);background:var(--teal-soft-2)}
+.pill.live{border-color:var(--teal-line);color:var(--teal-strong);background:var(--teal-soft)}
+.pill.off{border-color:var(--line-strong);color:var(--muted-2);background:var(--surface-2)}
+.pill.win{border-color:var(--teal-line);color:var(--teal-strong);background:var(--teal-soft)}
+.pill.loss{border-color:var(--danger-line);color:var(--danger);background:var(--danger-soft)}
+.pill.draw{border-color:var(--line-strong);color:var(--muted);background:var(--surface-2)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:none;flex:none}
+.dot.busy{background:#c9931f}
+.dot.off{background:#b7c9c6}
 .muted{color:var(--muted)}
 .tiny{font-size:11.5px}
 .mono{font-variant-numeric:tabular-nums}
@@ -3434,187 +3659,236 @@ h1,h2,h3,h4{font-family:var(--serif);font-weight:600;letter-spacing:.01em;margin
 .divider{height:1px;background:var(--line-soft);margin:12px 0}
 
 /* ---------- auth ---------- */
-.auth-view{min-height:100vh;display:grid;grid-template-columns:1.05fr .95fr;align-items:stretch}
+.auth-view{min-height:100vh;display:grid;grid-template-columns:1.02fr .98fr;align-items:stretch;background:var(--bg)}
 .auth-art{
   position:relative;padding:56px clamp(28px,5vw,72px);display:flex;flex-direction:column;justify-content:center;gap:26px;
-  background:radial-gradient(700px 500px at 20% 15%,rgba(47,143,111,.25),transparent 65%);border-right:1px solid var(--line-soft);
-  overflow:hidden;
+  background:var(--teal-soft-2);border-right:1px solid var(--line);overflow:hidden;
 }
-.auth-art .ghost-piece{position:absolute;right:-60px;bottom:-90px;width:min(58%,520px);opacity:.16;filter:drop-shadow(0 30px 60px #000);pointer-events:none}
+.auth-art .ghost-piece{position:absolute;right:-60px;bottom:-90px;width:min(58%,520px);opacity:.10;pointer-events:none}
 .auth-brand{display:flex;align-items:center;gap:14px}
-.auth-mark{width:52px;height:52px;border-radius:14px;border:1px solid var(--gold-dim);background:linear-gradient(160deg,#164036,#0b2220);display:grid;place-items:center;overflow:hidden;box-shadow:var(--shadow-md)}
+.auth-mark{width:52px;height:52px;border-radius:0;border:1px solid var(--teal-line);background:#fff;display:grid;place-items:center;overflow:hidden}
 .auth-mark img{width:44px;height:44px}
-.auth-brand h1{font-size:26px;letter-spacing:.14em;color:var(--gold-bright)}
-.auth-brand span{display:block;font:10.5px/1 var(--sans);letter-spacing:.32em;color:var(--muted);text-transform:uppercase;margin-top:7px}
-.auth-art h2{font-size:clamp(28px,3.4vw,44px);line-height:1.12;max-width:15ch;letter-spacing:-.02em}
-.auth-art h2 em{font-style:normal;color:var(--gold-bright)}
-.auth-art p{max-width:44ch;color:var(--muted);font-size:14.5px;line-height:1.7;margin:0}
+.auth-brand h1{font-family:var(--serif);font-size:26px;letter-spacing:.14em;color:var(--teal-deep);font-weight:600}
+.auth-brand span{display:block;font:10.5px/1 var(--sans);letter-spacing:.3em;color:var(--muted);text-transform:uppercase;margin-top:7px}
+.auth-art h2{font-family:var(--serif);font-weight:600;font-size:clamp(28px,3.2vw,44px);line-height:1.14;max-width:15ch;letter-spacing:-.02em;color:var(--ink)}
+.auth-art h2 em{font-style:normal;color:var(--teal)}
+.auth-art p{max-width:44ch;color:var(--ink-2);font-size:14.5px;line-height:1.7;margin:0}
 .auth-features{display:grid;gap:12px;max-width:46ch;margin-top:4px}
-.auth-feature{display:flex;gap:11px;font-size:13.5px;color:#cfe0da}
-.auth-feature b{color:var(--ivory);font-weight:600}
-.auth-feature .ico{width:26px;height:26px;flex:none;border-radius:8px;border:1px solid var(--line);display:grid;place-items:center;background:rgba(0,0,0,.25);color:var(--gold);font-size:13px}
-.auth-panel{display:grid;place-items:center;padding:34px clamp(20px,4vw,54px)}
-.auth-card{width:min(100%,430px);background:linear-gradient(180deg,rgba(18,44,40,.94),rgba(8,22,22,.97));border:1px solid var(--line);border-radius:18px;padding:26px 26px 22px;box-shadow:var(--shadow-lg)}
-.auth-tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,.3);border:1px solid var(--line-soft);border-radius:11px;padding:5px;margin-bottom:20px}
-.auth-tabs button{background:transparent;border:0;border-radius:8px;padding:10px;font-size:13px;font-weight:700;color:var(--muted);transition:background .2s,color .2s}
-.auth-tabs button.active{background:linear-gradient(180deg,#1d574a,#133b32);color:var(--ivory);box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
+.auth-feature{display:flex;gap:11px;font-size:13.5px;color:var(--ink-2)}
+.auth-feature b{color:var(--ink);font-weight:650}
+.auth-feature .ico{width:26px;height:26px;flex:none;border-radius:0;border:1px solid var(--teal-line);display:grid;place-items:center;background:#fff;color:var(--teal-strong);font-size:13px}
+.auth-panel{display:grid;place-items:center;padding:34px clamp(20px,4vw,54px);background:var(--bg)}
+.auth-card{width:min(100%,430px);background:#fff;border:1px solid var(--line);border-radius:0;padding:26px 26px 22px}
+.auth-tabs{display:grid;grid-template-columns:1fr 1fr;gap:0;background:var(--surface-2);border:1px solid var(--line);border-radius:0;padding:0;margin-bottom:20px}
+.auth-tabs button{background:transparent;border:0;border-radius:0;padding:11px 10px;font-size:13px;font-weight:700;color:var(--muted);transition:background .16s,color .16s;border-bottom:2px solid transparent}
+.auth-tabs button.active{background:#fff;color:var(--teal-strong);border-bottom-color:var(--teal)}
 .field{display:block;margin-bottom:13px}
-.field label{display:block;font-size:11.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted-2);margin-bottom:6px}
+.field label{display:block;font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
 .field input,.field select,.input{
-  width:100%;background:rgba(4,12,14,.75);border:1px solid var(--line);border-radius:9px;padding:11px 12px;
-  color:var(--ivory);transition:border-color .15s,box-shadow .15s;
+  width:100%;background:#fff;border:1px solid var(--line-strong);border-radius:0;padding:11px 12px;
+  color:var(--ink);transition:border-color .14s,box-shadow .14s;
 }
-.field input::placeholder{color:#63756f}
-.field input:focus,.field select:focus,.input:focus{border-color:var(--gold-dim);box-shadow:0 0 0 3px rgba(198,164,92,.14);outline:none}
+.field input::placeholder,.input::placeholder{color:#9db5b1}
+.field input:focus,.field select:focus,.input:focus{border-color:var(--teal);box-shadow:0 0 0 3px var(--teal-soft);outline:none}
 .form-msg{min-height:18px;font-size:12.5px;margin:2px 0 10px;color:var(--danger)}
-.form-msg.ok{color:#7fe0b6}
+.form-msg.ok{color:var(--teal-strong)}
 .fine-print{font-size:11.5px;color:var(--muted-2);line-height:1.6;margin:14px 0 0;border-top:1px solid var(--line-soft);padding-top:12px}
 
 /* ---------- top bar ---------- */
 .topbar{
   position:sticky;top:0;z-index:40;display:flex;align-items:center;justify-content:space-between;gap:14px;
-  padding:12px clamp(12px,2.2vw,26px);border-bottom:1px solid var(--line-soft);
-  background:linear-gradient(180deg,rgba(6,15,26,.96),rgba(6,15,26,.82));backdrop-filter:blur(10px);
+  padding:11px clamp(12px,2.2vw,26px);border-bottom:1px solid var(--line);background:#fff;
 }
 .brand-small{display:flex;align-items:center;gap:11px;min-width:0}
-.brand-small .auth-mark{width:40px;height:40px;flex:none;border-radius:11px}
-.brand-small .auth-mark img{width:34px;height:34px}
-.brand-small strong{display:block;font-family:var(--serif);font-size:15.5px;letter-spacing:.16em;color:var(--gold-bright)}
-.brand-small small{display:block;font-size:9.5px;letter-spacing:.26em;text-transform:uppercase;color:var(--muted-2);margin-top:3px}
+.brand-small .auth-mark{width:38px;height:38px;flex:none;border-radius:0}
+.brand-small .auth-mark img{width:32px;height:32px}
+.brand-small strong{display:block;font-family:var(--serif);font-size:15.5px;letter-spacing:.16em;color:var(--teal-deep);font-weight:600}
+.brand-small small{display:block;font-size:9.5px;letter-spacing:.24em;text-transform:uppercase;color:var(--muted-2);margin-top:3px}
 .topbar-right{display:flex;align-items:center;gap:9px;flex-wrap:wrap;justify-content:flex-end}
-.userchip{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:999px;padding:5px 13px 5px 5px;background:rgba(0,0,0,.28)}
-.avatar{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:13px;color:#20170a;background:linear-gradient(160deg,#e7cd92,#b0903f);letter-spacing:.02em;flex:none}
-.userchip .uname{display:block;font-size:13px;font-weight:700;line-height:1.1}
-.userchip .urating{display:block;font-size:11px;color:var(--gold-bright);font-variant-numeric:tabular-nums;letter-spacing:.04em;margin-top:2px}
+.userchip{display:flex;align-items:center;gap:9px;border:1px solid var(--line);border-radius:0;padding:4px 12px 4px 4px;background:var(--surface-2)}
+.avatar{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:12.5px;color:#fff;background:var(--teal);letter-spacing:.02em;flex:none}
+.userchip .uname{display:block;font-size:12.5px;font-weight:650;line-height:1.1;color:var(--ink)}
+.userchip .urating{display:block;font-size:10.5px;color:var(--teal-strong);font-variant-numeric:tabular-nums;margin-top:2px}
 
 /* ---------- lobby ---------- */
-.lobby{max-width:1560px;margin:0 auto;padding:20px clamp(12px,2.2vw,26px) 60px;display:grid;grid-template-columns:1.05fr 1.1fr .9fr;gap:18px;align-items:start}
-.lobby .col{display:grid;gap:18px;min-width:0}
-.statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:13px}
-.stat{background:rgba(0,0,0,.28);border:1px solid var(--line-soft);border-radius:11px;padding:10px 8px;text-align:center}
-.stat b{display:block;font-size:19px;font-family:var(--serif);color:var(--ivory);font-variant-numeric:tabular-nums}
-.stat span{display:block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted-2);margin-top:4px}
+.lobby{max-width:1560px;margin:0 auto;padding:18px clamp(12px,2.2vw,26px) 60px;display:grid;grid-template-columns:1.05fr 1.1fr .9fr;gap:16px;align-items:start}
+.lobby .col{display:grid;gap:16px;min-width:0}
+.statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;margin-top:13px;border:1px solid var(--line)}
+.stat{background:#fff;border-right:1px solid var(--line);border-radius:0;padding:11px 8px;text-align:center}
+.stat:last-child{border-right:0}
+.stat b{display:block;font-size:19px;font-family:var(--serif);color:var(--ink);font-variant-numeric:tabular-nums;font-weight:600}
+.stat span{display:block;font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted-2);margin-top:4px}
 .rating-hero{display:flex;align-items:flex-end;gap:12px;margin-top:2px}
-.rating-hero .big{font-family:var(--serif);font-size:40px;line-height:1;color:var(--gold-bright);font-variant-numeric:tabular-nums}
-.rating-hero .lbl{font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted-2);padding-bottom:6px}
-.rules-note{margin-top:14px;font-size:11.5px;line-height:1.65;color:var(--muted);background:rgba(198,164,92,.07);border:1px solid rgba(198,164,92,.22);border-radius:10px;padding:10px 12px}
-.rules-note b{color:var(--gold-bright)}
-.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;background:rgba(0,0,0,.3);border:1px solid var(--line-soft);border-radius:10px;padding:4px;margin-bottom:12px}
-.seg button{background:transparent;border:0;border-radius:7px;padding:8px 4px;font-size:12px;font-weight:700;color:var(--muted)}
-.seg button.active{background:linear-gradient(180deg,#1d574a,#133b32);color:var(--ivory)}
-.playgrid{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}
-.list{display:grid;gap:7px;max-height:330px;overflow:auto;padding-right:2px}
-.list-row{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:10px;background:rgba(0,0,0,.2);transition:border-color .16s,background .16s}
-.list-row:hover{border-color:var(--line);background:rgba(0,0,0,.3)}
+.rating-hero .big{font-family:var(--serif);font-size:40px;line-height:1;color:var(--teal);font-variant-numeric:tabular-nums;font-weight:600}
+.rating-hero .lbl{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted-2);padding-bottom:6px}
+.rules-note{margin-top:14px;font-size:11.5px;line-height:1.65;color:var(--ink-2);background:var(--teal-soft-2);border:1px solid var(--teal-line);border-left:3px solid var(--teal);border-radius:0;padding:10px 12px}
+.rules-note b{color:var(--teal-deep)}
+.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:0;background:var(--surface-2);border:1px solid var(--line);border-radius:0;padding:0;margin-bottom:12px}
+.seg button{background:transparent;border:0;border-right:1px solid var(--line);border-radius:0;padding:9px 4px;font-size:12px;font-weight:700;color:var(--muted)}
+.seg button:last-child{border-right:0}
+.seg button.active{background:var(--teal);color:#fff}
+.playgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.list{display:grid;gap:8px;max-height:330px;overflow:auto;padding-right:2px}
+.list-row{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:0;background:#fff;transition:border-color .14s,background .14s}
+.list-row:hover{border-color:var(--teal-line);background:var(--teal-soft-2)}
 .list-row .who{min-width:0}
-.list-row .who b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list-row .who b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
 .list-row .who span{font-size:11px;color:var(--muted-2)}
-.list-row .who .me-tag{color:var(--gold);font-weight:700}
-.rating-tag{font-family:var(--serif);font-size:14px;color:var(--gold-bright);font-variant-numeric:tabular-nums}
-.invite-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;padding:9px 10px;border:1px solid var(--gold-dim);border-radius:10px;background:rgba(198,164,92,.08)}
-.countdown{font-size:11px;color:var(--gold-bright);font-variant-numeric:tabular-nums}
-.note-list{display:grid;gap:7px;max-height:260px;overflow:auto}
-.note-item{border-left:2px solid var(--gold-dim);padding:2px 0 2px 10px}
-.note-item b{display:block;font-size:12.5px;color:var(--ivory)}
+.list-row .who .me-tag{color:var(--teal-strong);font-weight:700}
+.rating-tag{font-family:var(--serif);font-size:14px;color:var(--teal-strong);font-variant-numeric:tabular-nums;font-weight:600}
+.invite-row{display:grid;grid-template-columns:1fr auto auto;gap:7px;align-items:center;padding:9px 10px;border:1px solid var(--teal-line);border-left:3px solid var(--teal);border-radius:0;background:var(--teal-soft-2)}
+.countdown{font-size:11px;color:var(--teal-strong);font-variant-numeric:tabular-nums}
+.note-list{display:grid;gap:0;max-height:260px;overflow:auto;border:1px solid var(--line)}
+.note-item{border-bottom:1px solid var(--line-soft);border-left:2px solid var(--line-strong);padding:8px 10px;background:#fff}
+.note-item:last-child{border-bottom:0}
+.note-item b{display:block;font-size:12.5px;color:var(--ink)}
 .note-item span{font-size:11.5px;color:var(--muted-2)}
-.note-item.unread{border-left-color:var(--emerald-bright)}
-.lb-row{display:grid;grid-template-columns:24px 1fr auto;gap:9px;align-items:center;padding:6px 8px;border-radius:8px;font-size:13px}
-.lb-row.me{background:rgba(198,164,92,.12);border:1px solid rgba(198,164,92,.3)}
+.note-item.unread{border-left-color:var(--teal);background:var(--teal-soft-2)}
+.lb-row{display:grid;grid-template-columns:24px 1fr auto;gap:9px;align-items:center;padding:7px 8px;border-radius:0;font-size:13px;border-bottom:1px solid var(--line-soft)}
+.lb-row:last-child{border-bottom:0}
+.lb-row.me{background:var(--teal-soft);border-left:3px solid var(--teal)}
 .lb-row .rank{font-family:var(--serif);color:var(--muted-2);text-align:right}
 .lb-row .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hist-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:7px 2px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+.hist-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
 .hist-row:last-child{border-bottom:0}
-.delta-pos{color:#7fe0b6;font-variant-numeric:tabular-nums;font-weight:700}
-.delta-neg{color:#f0a79c;font-variant-numeric:tabular-nums;font-weight:700}
+.delta-pos{color:var(--teal-strong);font-variant-numeric:tabular-nums;font-weight:700}
+.delta-neg{color:var(--danger);font-variant-numeric:tabular-nums;font-weight:700}
 .delta-zero{color:var(--muted-2);font-variant-numeric:tabular-nums}
 
 /* ---------- game view ---------- */
-.gamewrap{max-width:1420px;margin:0 auto;padding:16px clamp(10px,2vw,24px) 44px;display:grid;grid-template-columns:minmax(0,1fr) 372px;gap:20px;align-items:start}
+.gamewrap{max-width:1420px;margin:0 auto;padding:16px clamp(10px,2vw,24px) 44px;display:grid;grid-template-columns:minmax(0,1fr) 372px;gap:18px;align-items:start}
 .boardcol{min-width:0;display:flex;flex-direction:column;align-items:center}
-.board-frame{width:min(100%,calc(100dvh - 348px),700px);min-width:250px;margin:0 auto}
-.playerbar{display:flex;align-items:center;justify-content:space-between;gap:10px;background:linear-gradient(180deg,rgba(19,51,45,.85),rgba(9,26,26,.9));border:1px solid var(--line);border-radius:11px;padding:8px 12px;min-height:52px}
-.playerbar.active{border-color:var(--gold-dim);box-shadow:0 0 0 1px rgba(198,164,92,.25),0 8px 22px rgba(0,0,0,.28)}
+.board-frame{width:min(100%,calc(100dvh - 348px),700px);min-width:250px;margin:0 auto;background:#fff;border:1px solid var(--line);padding:10px}
+.playerbar{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--surface-2);border:1px solid var(--line);border-radius:0;padding:8px 11px;min-height:50px}
+.playerbar.active{border-color:var(--teal);background:var(--teal-soft-2);box-shadow:inset 3px 0 0 var(--teal)}
 .playerbar .who{display:flex;align-items:center;gap:9px;min-width:0}
-.playerbar .who b{font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42vw}
-.playerbar .who .pr{font-size:11.5px;color:var(--gold-bright);font-variant-numeric:tabular-nums}
+.playerbar .who b{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42vw;color:var(--ink)}
+.playerbar .who .pr{font-size:11px;color:var(--teal-strong);font-variant-numeric:tabular-nums}
 .captured{display:flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;min-height:22px;gap:0}
-.captured img{width:21px;height:21px;margin-left:-7px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}
+.captured img{width:21px;height:21px;margin-left:-7px}
 .captured .capscore{font-size:11.5px;color:var(--muted);margin-left:8px;font-variant-numeric:tabular-nums}
 .board-shell{position:relative;margin:9px 0}
 .board{
   display:grid;grid-template-columns:repeat(8,1fr);aspect-ratio:1/1;width:100%;
-  border:5px solid var(--gold);border-radius:8px;overflow:hidden;
-  box-shadow:0 30px 70px rgba(0,0,0,.55),0 0 0 1px rgba(0,0,0,.7) inset;touch-action:manipulation;
-  background:#123;
+  border:1px solid var(--line-strong);border-radius:0;overflow:hidden;
+  touch-action:manipulation;background:var(--sq-light);
 }
 .square{position:relative;display:grid;place-items:center;border:0;border-radius:0;padding:0;min-width:0;aspect-ratio:1;transition:filter .12s}
 .square.light{background:var(--sq-light)}
 .square.dark{background:var(--sq-dark)}
-.square:hover{filter:brightness(1.06)}
+.square:hover{filter:brightness(1.04)}
 .square.last::before,.square.selected::before,.square.check::before,.square.hint::after{content:"";position:absolute;inset:0;pointer-events:none}
-.square.last::before{background:rgba(232,191,73,.42)}
-.square.selected::before{background:rgba(255,230,90,.55);box-shadow:inset 0 0 0 3px rgba(255,236,140,.75)}
-.square.check::before{background:radial-gradient(circle,rgba(225,62,62,.9),transparent 72%)}
-.square.hint::after{box-shadow:inset 0 0 0 3px rgba(90,220,170,.85)}
-.square:focus-visible{outline:3px solid #ffdd70;outline-offset:-3px;z-index:4}
-.piece{position:relative;width:94%;height:94%;z-index:2;object-fit:contain;pointer-events:none;filter:drop-shadow(0 2px 3px rgba(0,0,0,.55))}
-.legal{position:absolute;border-radius:50%;width:26%;height:26%;background:rgba(18,94,71,.55);z-index:3;pointer-events:none}
-.legal.capture{width:86%;height:86%;background:none;border:4px solid rgba(23,105,78,.72)}
-.coord{position:absolute;z-index:3;font-size:clamp(8px,1vw,11px);font-weight:700;pointer-events:none;opacity:.72}
-.light .coord{color:#1d4a39}.dark .coord{color:#f4ebdd}
+.square.last::before{background:rgba(0,128,128,.20)}
+.square.selected::before{background:rgba(0,128,128,.26);box-shadow:inset 0 0 0 3px var(--teal)}
+.square.check::before{background:radial-gradient(circle,rgba(194,59,43,.72),transparent 72%)}
+.square.hint::after{box-shadow:inset 0 0 0 3px rgba(0,128,128,.55)}
+.square:focus-visible{outline:3px solid var(--teal-deep);outline-offset:-3px;z-index:4}
+.piece{position:relative;width:94%;height:94%;z-index:2;object-fit:contain;pointer-events:none;filter:drop-shadow(0 1px 1px rgba(13,43,41,.35))}
+.legal{position:absolute;border-radius:50%;width:24%;height:24%;background:rgba(0,128,128,.55);z-index:3;pointer-events:none}
+.legal.capture{width:84%;height:84%;background:none;border:3px solid rgba(0,128,128,.62)}
+.coord{position:absolute;z-index:3;font-size:clamp(8px,1vw,10.5px);font-weight:700;pointer-events:none;opacity:.85}
+.light .coord{color:#5d8f88}.dark .coord{color:#f2fbf9}
 .coord.rank{top:2px;left:3px}.coord.file{right:3px;bottom:1px}
-.status{width:min(100%,700px);margin:10px auto 0;text-align:center;padding:9px 12px;background:rgba(0,0,0,.28);border:1px solid var(--line-soft);border-radius:10px;font-size:13.5px;color:#e9d6a1;min-height:40px;display:grid;place-items:center}
-.status.alert{color:#ffd0c8;border-color:#8f4a42;background:rgba(143,74,66,.16)}
-.status.win{color:#9df3c9;border-color:#3f8f74;background:rgba(63,143,116,.14)}
+.status{width:min(100%,700px);margin:10px auto 0;text-align:center;padding:10px 12px;background:#fff;border:1px solid var(--line);border-left:3px solid var(--teal);border-radius:0;font-size:13px;color:var(--ink-2);min-height:40px;display:grid;place-items:center}
+.status.alert{color:var(--danger);border-color:var(--danger-line);border-left-color:var(--danger);background:var(--danger-soft)}
+.status.win{color:var(--teal-deep);border-color:var(--teal-line);border-left-color:var(--teal);background:var(--teal-soft-2)}
 .gameactions{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:8px;width:min(100%,700px);margin:9px auto 0}
-.sidepanel{display:grid;gap:14px;min-width:0}
-.scorebox{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.scorecard{background:rgba(0,0,0,.26);border:1px solid var(--line-soft);border-radius:11px;padding:10px 12px}
-.scorecard b{display:block;font-family:var(--serif);font-size:24px;color:var(--gold-bright);font-variant-numeric:tabular-nums;line-height:1.1}
-.scorecard span{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted-2)}
-.movelist{max-height:min(42vh,360px);overflow:auto;font-variant-numeric:tabular-nums}
-.move-row{display:grid;grid-template-columns:34px 1fr 1fr;gap:4px;padding:4px 6px;border-radius:6px;font-size:13px}
-.move-row:nth-child(odd){background:rgba(255,255,255,.03)}
+.sidepanel{display:grid;gap:12px;min-width:0}
+.scorebox{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--line);background:#fff}
+.scorecard{background:#fff;border-right:1px solid var(--line);border-radius:0;padding:10px 12px}
+.scorecard:last-child{border-right:0}
+.scorecard b{display:block;font-family:var(--serif);font-size:24px;color:var(--teal);font-variant-numeric:tabular-nums;line-height:1.1;font-weight:600}
+.scorecard span{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted-2)}
+.movelist{max-height:min(42vh,360px);overflow:auto;font-variant-numeric:tabular-nums;border:1px solid var(--line)}
+.move-row{display:grid;grid-template-columns:34px 1fr 1fr;gap:4px;padding:5px 7px;border-radius:0;font-size:12.5px;border-bottom:1px solid var(--line-soft)}
+.move-row:nth-child(even){background:var(--surface-2)}
 .move-row .num{color:var(--muted-2)}
-.move-row .san{font-weight:600}
-.move-row .san.last{color:var(--gold-bright)}
-.offer-banner{border:1px solid var(--gold-dim);background:rgba(198,164,92,.12);border-radius:11px;padding:11px 12px;display:grid;gap:9px}
+.move-row .san{font-weight:600;color:var(--ink)}
+.move-row .san.last{color:var(--teal-strong)}
+.offer-banner{border:1px solid var(--teal-line);border-left:3px solid var(--teal);background:var(--teal-soft-2);border-radius:0;padding:11px 12px;display:grid;gap:9px}
 .offer-banner .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .coach-box{display:grid;gap:9px}
-.coach-log{max-height:190px;overflow:auto;display:grid;gap:9px;font-size:12.5px;line-height:1.6}
-.coach-msg{padding:9px 11px;border-radius:10px;background:rgba(0,0,0,.28);border:1px solid var(--line-soft);white-space:pre-wrap;overflow-wrap:anywhere}
-.coach-msg.user{background:rgba(47,143,111,.18);border-color:#2f6f5c;justify-self:end;max-width:92%}
+.coach-log{max-height:190px;overflow:auto;display:grid;gap:8px;font-size:12.5px;line-height:1.6}
+.coach-msg{padding:9px 11px;border-radius:0;background:var(--surface-2);border:1px solid var(--line);white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-2)}
+.coach-msg.user{background:var(--teal-soft);border-color:var(--teal-line);justify-self:end;max-width:92%}
 .coach-form{display:grid;grid-template-columns:1fr auto;gap:7px}
-.coach-form input{width:100%;background:rgba(4,12,14,.7);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:12.5px}
+.coach-form input{width:100%;background:#fff;border:1px solid var(--line-strong);border-radius:0;padding:9px 11px;font-size:12.5px}
 
 /* ---------- dialogs, toasts ---------- */
 dialog{
-  width:calc(100% - 32px);max-width:440px;background:linear-gradient(180deg,#102b27,#081a1a);color:var(--ivory);
-  border:1px solid var(--gold-dim);border-radius:16px;padding:22px;box-shadow:var(--shadow-lg);
+  width:calc(100% - 32px);max-width:440px;background:#fff;color:var(--ink);
+  border:1px solid var(--line-strong);border-radius:0;padding:22px;
 }
-dialog::backdrop{background:rgba(2,8,10,.72);backdrop-filter:blur(3px)}
-dialog h2{font-size:21px;color:var(--gold-bright);margin-bottom:10px}
-dialog p{color:#c8d6d0;font-size:13.5px;line-height:1.65;margin:0 0 6px}
+dialog::backdrop{background:rgba(13,43,41,.42)}
+dialog h2{font-size:20px;color:var(--ink);margin-bottom:10px}
+dialog p{color:var(--ink-2);font-size:13.5px;line-height:1.65;margin:0 0 6px}
 .dialog-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px;flex-wrap:wrap}
-.promo{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:14px}
-.promo button{background:linear-gradient(180deg,#1d574a,#123b33);border:1px solid var(--gold-dim);border-radius:11px;padding:8px;transition:transform .14s,border-color .14s}
-.promo button:hover{transform:translateY(-2px);border-color:var(--gold-bright)}
+.promo{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.promo button{background:var(--surface-2);border:1px solid var(--line-strong);border-radius:0;padding:8px;transition:border-color .14s,background .14s}
+.promo button:hover{border-color:var(--teal);background:var(--teal-soft-2)}
 .promo img{width:100%;height:auto;display:block}
-.toasts{position:fixed;right:16px;bottom:16px;z-index:100;display:grid;gap:9px;max-width:min(92vw,360px)}
+.toasts{position:fixed;right:16px;bottom:16px;z-index:100;display:grid;gap:8px;max-width:min(92vw,360px)}
 .toast{
-  background:linear-gradient(180deg,rgba(20,54,47,.98),rgba(9,26,26,.98));border:1px solid var(--line);
-  border-left:3px solid var(--gold);border-radius:11px;padding:11px 13px;box-shadow:var(--shadow-md);
-  animation:toastIn .25s ease both;font-size:13px;
+  background:#fff;border:1px solid var(--line);border-left:3px solid var(--teal);
+  border-radius:0;padding:11px 13px;animation:toastIn .2s ease both;font-size:13px;
 }
-.toast b{display:block;font-size:12.5px;margin-bottom:2px;color:var(--ivory)}
+.toast b{display:block;font-size:12.5px;margin-bottom:2px;color:var(--ink)}
 .toast span{color:var(--muted);font-size:12px;line-height:1.5}
-.toast.error{border-left-color:var(--danger)}
-.toast.success{border-left-color:var(--emerald-bright)}
-.toast.info{border-left-color:var(--teal)}
-@keyframes toastIn{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
-.result-banner{border:1px solid var(--gold-dim);border-radius:13px;padding:14px;background:linear-gradient(160deg,rgba(198,164,92,.16),rgba(47,143,111,.12));display:grid;gap:6px}
-.result-banner h4{font-size:19px;color:var(--gold-bright)}
-.result-banner .delta{font-family:var(--serif);font-size:26px;font-variant-numeric:tabular-nums}
+.toast.error{border-left-color:var(--danger);background:var(--danger-soft)}
+.toast.success{border-left-color:var(--teal)}
+.toast.info{border-left-color:var(--teal);background:var(--teal-soft-2)}
+@keyframes toastIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.result-banner{border:1px solid var(--teal-line);border-left:3px solid var(--teal);border-radius:0;padding:14px;background:var(--teal-soft-2);display:grid;gap:6px}
+.result-banner h4{font-size:18px;color:var(--teal-deep)}
+.result-banner .delta{font-family:var(--serif);font-size:26px;font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink)}
+
+/* ---------- live match clock ---------- */
+.clock{font:700 14px/1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:.05em;padding:6px 10px;border-radius:0;border:1px solid var(--teal-line);background:var(--teal-soft-2);color:var(--teal-deep)}
+.clock.low{border-color:var(--danger-line);background:var(--danger-soft);color:var(--danger);animation:clockPulse 1s steps(2,end) infinite}
+@keyframes clockPulse{50%{opacity:.5}}
+
+/* ---------- incoming challenge: call-style popup ---------- */
+.ringpop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(13,43,41,.42)}
+.ring-card{width:min(370px,100%);border-radius:0;border:1px solid var(--line-strong);border-top:3px solid var(--teal);background:#fff;padding:22px 20px 18px;text-align:center;position:relative;overflow:hidden}
+.ring-avatar{width:72px;height:72px;margin:8px auto 14px;border-radius:50%;display:grid;place-items:center;font:600 28px var(--serif);color:#fff;background:var(--teal);position:relative}
+.ring-avatar::before,.ring-avatar::after{content:"";position:absolute;inset:-9px;border-radius:50%;border:2px solid rgba(0,128,128,.45);animation:ringWave 1.9s ease-out infinite}
+.ring-avatar::after{border-color:rgba(0,128,128,.24);animation-delay:.65s}
+@keyframes ringWave{0%{transform:scale(.88);opacity:.9}100%{transform:scale(1.5);opacity:0}}
+.ring-card h4{font:700 10.5px/1.4 var(--sans);letter-spacing:.2em;text-transform:uppercase;color:var(--teal-strong);margin:0 0 6px}
+.ring-name{font:600 20px var(--serif);color:var(--ink)}
+.ring-rating{font-size:11.5px;color:var(--muted);margin-top:3px;font-variant-numeric:tabular-nums}
+.ring-note{font-size:11.5px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);border-radius:0;padding:9px 11px;margin:14px 0 0;text-align:left;line-height:1.55}
+.ring-note b{color:var(--danger)}
+.ring-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.ring-actions .btn{padding:12px 10px;font-size:13.5px}
+.ring-decline{background:#fff;border-color:var(--danger-line);color:var(--danger)}
+.ring-decline:hover:not(:disabled){background:var(--danger-soft);border-color:var(--danger)}
+.ring-count{font-size:11px;color:var(--muted-2);margin-top:10px;font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:reduce){.ring-avatar::before,.ring-avatar::after{animation:none}}
+
+/* ---------- live matches / spectating ---------- */
+.live-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:0;background:#fff;margin-bottom:8px}
+.live-row:hover{border-color:var(--teal-line)}
+.live-row .vs{font-size:12.5px;line-height:1.4;min-width:0}
+.live-row .vs b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+.live-row .vs span{color:var(--muted-2);font-size:11px}
+.live-row .meta{display:flex;align-items:center;gap:7px;flex-shrink:0}
+.spec-pill{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--teal-strong);border:1px solid var(--teal-line);background:var(--teal-soft);border-radius:0;padding:3px 8px}
+.board.readonly .square{cursor:default}
+.board.readonly .square:hover{filter:none}
+.spectator-banner{display:flex;align-items:center;gap:9px;flex-wrap:wrap;border:1px solid var(--teal-line);border-left:3px solid var(--teal);background:var(--teal-soft-2);color:var(--ink-2);border-radius:0;padding:9px 12px;font-size:12.5px;margin-bottom:10px;width:min(100%,700px);margin-left:auto;margin-right:auto}
+.spectator-banner b{color:var(--teal-deep)}
+
+/* ---------- match chat ---------- */
+.chat-log{display:flex;flex-direction:column;gap:6px;max-height:210px;overflow-y:auto;margin-bottom:9px;padding:8px;border:1px solid var(--line);background:var(--surface-2)}
+.chat-msg{font-size:12.5px;line-height:1.45;border:1px solid var(--line);border-radius:0;background:#fff;padding:6px 9px;word-break:break-word;color:var(--ink-2)}
+.chat-msg b{color:var(--teal-deep);font-weight:700}
+.chat-msg .tag{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--teal-strong);background:var(--teal-soft);border:1px solid var(--teal-line);border-radius:0;padding:1px 6px;margin-left:6px;vertical-align:1px}
+.chat-msg.spectator{border-left:2px solid var(--teal)}
+.chat-msg.mine{background:var(--teal-soft-2);border-color:var(--teal-line)}
+.chat-msg.system{color:var(--muted);font-style:italic;background:transparent;border-style:dashed}
+.chat-form{display:flex;gap:8px}
+.chat-form .input{flex:1;min-width:0}
 
 /* ---------- responsive ---------- */
 @media (max-width:1200px){
@@ -3623,8 +3897,8 @@ dialog p{color:#c8d6d0;font-size:13.5px;line-height:1.65;margin:0 0 6px}
 }
 @media (max-width:940px){
   .auth-view{grid-template-columns:1fr}
-  .auth-art{padding:34px 22px 22px;border-right:0;border-bottom:1px solid var(--line-soft)}
-  .auth-art h2{font-size:30px;max-width:22ch}
+  .auth-art{padding:32px 22px 22px;border-right:0;border-bottom:1px solid var(--line)}
+  .auth-art h2{font-size:29px;max-width:22ch}
   .auth-art .ghost-piece{display:none}
   .auth-features{display:none}
   .auth-panel{padding:24px 18px 40px}
@@ -3634,109 +3908,47 @@ dialog p{color:#c8d6d0;font-size:13.5px;line-height:1.65;margin:0 0 6px}
   .sidepanel{order:2}
 }
 @media (max-width:620px){
-  .topbar{padding:8px 10px;gap:8px}
-  .topbar-right{gap:6px;flex-wrap:nowrap}
+  .topbar{padding:8px 9px;gap:6px}
+  .topbar-right{gap:5px;flex-wrap:nowrap;flex:0 0 auto}
   #btnSound{display:none}
-  #btnLogout{padding:7px 9px;font-size:12px}
-  .brand-small .auth-mark{width:32px;height:32px;border-radius:9px}
-  .brand-small .auth-mark img{width:27px;height:27px}
-  .userchip{gap:7px}
-  .userchip .avatar{width:26px;height:26px;font-size:11px}
-  .userchip .uname{max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .pill{padding:3px 7px;font-size:10px}
+  #connPill,#gameConn{display:none}
+  #btnLogout{font-size:11px;padding:6px 9px}
+  .brand-small{gap:7px;flex:0 1 auto;overflow:hidden}
+  .brand-small .auth-mark{width:30px;height:30px}
+  .brand-small .auth-mark img{width:26px;height:26px}
+  .brand-small strong{font-size:11.5px;letter-spacing:.06em;white-space:nowrap}
   .brand-small small{display:none}
-  .brand-small strong{font-size:13px;letter-spacing:.1em}
-  .userchip{padding:4px 10px 4px 4px}
-  .userchip .uname{font-size:12px}
-  .lobby{padding:12px 10px 40px;gap:13px}
-  .card{padding:13px 13px;border-radius:12px}
-  .statgrid{grid-template-columns:repeat(4,1fr);gap:6px}
+  .userchip{padding:3px 8px 3px 3px;gap:6px;max-width:118px}
+  .userchip .avatar{width:24px;height:24px;font-size:10px}
+  .userchip .uname{font-size:11px;max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .userchip .urating{font-size:9.5px}
+  .pill{padding:3px 7px;font-size:9.5px}
+  .lobby{padding:12px 10px 40px;gap:12px}
+  .lobby .col{gap:12px}
+  .card{padding:13px;border-radius:0}
+  .statgrid{gap:0}
   .stat b{font-size:16px}
-  .stat span{font-size:9px}
-  .gamewrap{padding:10px 9px 30px;gap:13px}
-  .board-frame{width:100%}
-  .board{border-width:4px}
-  .gameactions{grid-template-columns:repeat(2,1fr)}
+  .stat span{font-size:8.5px}
+  .gamewrap{padding:10px 9px 30px;gap:12px}
+  .board-frame{width:100%;padding:7px}
+  .gameactions{grid-template-columns:repeat(2,minmax(0,1fr))}
   .playerbar{padding:6px 9px;min-height:44px}
   .playerbar .who b{max-width:38vw;font-size:12.5px}
   .captured img{width:17px;height:17px}
-  .toasts{right:8px;left:8px;bottom:8px;top:auto;max-width:none;pointer-events:none}
-  .toast{padding:9px 11px;font-size:12px}
+  .toasts{right:8px;left:8px;bottom:8px;max-width:none}
+  .toast{padding:9px 11px}
   .toast span{font-size:11px}
-  #gameMeta,#gameConn{display:none}
-  .auth-tabs button{padding:9px 6px;font-size:12.5px}
+  #gameMeta{display:none}
+  .auth-tabs button{padding:10px 6px;font-size:12.5px}
   dialog{padding:18px}
   .result-banner .delta{font-size:22px}
-}
-
-/* ---------- phone top bar: keep the brand, the player and the controls apart ---------- */
-@media (max-width:620px){
-  .topbar{gap:6px;padding:8px 9px}
-  .brand-small{gap:7px;flex:0 1 auto;overflow:hidden}
-  .brand-small strong{font-size:11.5px;letter-spacing:.06em;white-space:nowrap}
-  .topbar-right{gap:5px;flex-wrap:nowrap;flex:0 0 auto}
-  #connPill,#gameConn{display:none}
-  .userchip{padding:3px 8px 3px 3px;gap:5px;max-width:118px}
-  .userchip .avatar{width:24px;height:24px;font-size:10px}
-  .userchip .uname{font-size:11px;max-width:60px}
-  .userchip .urating{font-size:9.5px}
-  #btnSound{font-size:10px;padding:5px 7px}
-  #btnLogout{font-size:11px;padding:6px 9px}
   .ring-card{padding:18px 15px 15px}
-  .ring-avatar{width:64px;height:64px;font-size:26px}
-  .gameactions{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .ring-avatar{width:62px;height:62px;font-size:24px}
   .spectator-banner{font-size:11.5px;padding:8px 10px}
   .chat-log{max-height:150px}
   .live-row{flex-wrap:wrap;gap:7px}
   .live-row .meta{width:100%;justify-content:space-between}
 }
-
-/* ---------- 10-minute live match clock ---------- */
-.clock{font:700 15px/1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:.06em;padding:6px 10px;border-radius:9px;border:1px solid var(--line);background:rgba(0,0,0,.34);color:#bfe8d8}
-.clock.low{border-color:#7d3a32;background:rgba(141,58,49,.3);color:#ffd9d0;animation:clockPulse 1s steps(2,end) infinite}
-@keyframes clockPulse{50%{opacity:.55}}
-
-/* ---------- incoming challenge: call-style popup ---------- */
-.ringpop{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(3,9,13,.66);backdrop-filter:blur(4px);animation:fade .2s ease both}
-.ring-card{width:min(370px,100%);border-radius:22px;border:1px solid var(--gold-dim);background:linear-gradient(180deg,rgba(20,54,47,.97),rgba(7,22,26,.99));box-shadow:0 30px 80px rgba(0,0,0,.62);padding:22px 20px 18px;text-align:center;position:relative;overflow:hidden}
-.ring-avatar{width:76px;height:76px;margin:8px auto 14px;border-radius:50%;display:grid;place-items:center;font:600 30px var(--serif);color:#241a06;background:linear-gradient(180deg,#e7cd92,#b0903f);position:relative}
-.ring-avatar::before,.ring-avatar::after{content:"";position:absolute;inset:-9px;border-radius:50%;border:2px solid rgba(198,164,92,.5);animation:ringWave 1.9s ease-out infinite}
-.ring-avatar::after{border-color:rgba(79,195,154,.42);animation-delay:.65s}
-@keyframes ringWave{0%{transform:scale(.88);opacity:.9}100%{transform:scale(1.5);opacity:0}}
-.ring-card h4{font:600 11px/1.4 var(--sans);letter-spacing:.22em;text-transform:uppercase;color:var(--gold);margin:0 0 6px}
-.ring-name{font:600 21px var(--serif);color:#f4ebdd}
-.ring-rating{font-size:11.5px;color:var(--gold-bright);margin-top:3px;font-variant-numeric:tabular-nums}
-.ring-note{font-size:11.5px;color:#cfe6dd;background:rgba(0,0,0,.32);border:1px solid var(--line-soft);border-radius:10px;padding:9px 11px;margin:14px 0 0;text-align:left;line-height:1.55}
-.ring-note b{color:#ffd9d0}
-.ring-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
-.ring-actions .btn{padding:12px 10px;font-size:13.5px}
-.ring-decline{background:linear-gradient(180deg,#8d3a31,#6d2a23);border-color:#c96a5c;color:#ffe9e4}
-.ring-decline:hover:not(:disabled){background:linear-gradient(180deg,#a34238,#7d3129)}
-.ring-count{font-size:11px;color:var(--muted-2);margin-top:10px;font-variant-numeric:tabular-nums}
-@media (prefers-reduced-motion:reduce){.ring-avatar::before,.ring-avatar::after{animation:none}}
-
-/* ---------- live matches / spectating ---------- */
-.live-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px;border:1px solid var(--line-soft);border-radius:10px;background:rgba(0,0,0,.22);margin-bottom:8px}
-.live-row .vs{font-size:12.5px;line-height:1.4;min-width:0}
-.live-row .vs b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.live-row .vs span{color:var(--muted-2);font-size:11px}
-.live-row .meta{display:flex;align-items:center;gap:7px;flex-shrink:0}
-.spec-pill{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#8de3bd;border:1px solid #3f8f74;background:rgba(63,143,116,.16);border-radius:999px;padding:3px 8px}
-.board.readonly .square{cursor:default}
-.board.readonly .square:hover{filter:none;transform:none}
-.spectator-banner{display:flex;align-items:center;gap:9px;flex-wrap:wrap;border:1px solid #3f8f74;background:rgba(63,143,116,.14);color:#cdeee0;border-radius:11px;padding:9px 12px;font-size:12.5px;margin-bottom:10px}
-.spectator-banner b{color:#8de3bd}
-
-/* ---------- match chat ---------- */
-.chat-log{display:flex;flex-direction:column;gap:6px;max-height:210px;overflow-y:auto;margin-bottom:9px;padding-right:2px}
-.chat-msg{font-size:12.5px;line-height:1.45;border:1px solid var(--line-soft);border-radius:10px;background:rgba(0,0,0,.24);padding:6px 9px;word-break:break-word}
-.chat-msg b{color:var(--gold-bright);font-weight:600}
-.chat-msg .tag{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#8de3bd;background:rgba(63,143,116,.18);border:1px solid #3f8f74;border-radius:999px;padding:1px 6px;margin-left:6px;vertical-align:1px}
-.chat-msg.spectator{border-left:2px solid var(--teal)}
-.chat-msg.mine{background:rgba(47,143,111,.15)}
-.chat-msg.system{color:var(--muted);font-style:italic;background:transparent;border-style:dashed}
-.chat-form{display:flex;gap:8px}
-.chat-form .input{flex:1;min-width:0}
 `;
 
 /* The artwork itself is injected once and reused by the browser renderer. */
@@ -3759,16 +3971,16 @@ function renderApp() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#07111f">
+<meta name="theme-color" content="#008080">
 <title>Grandmaster — Online Chess</title>
 <style>${APP_CSS}</style>
 </head>
 <body>
 <div id="boot-splash" class="view splash">
   <div style="text-align:center">
-    <div style="width:64px;height:64px;margin:0 auto 16px;border-radius:18px;border:1px solid #8a7440;display:grid;place-items:center;background:#0b2220" id="splashMark"></div>
-    <h2 style="font:600 22px var(--serif);letter-spacing:.2em;color:#e7cd92">GRANDMASTER</h2>
-    <p style="color:#7d918b;font-size:12px;letter-spacing:.2em;text-transform:uppercase;margin-top:10px">Loading your club…</p>
+    <div style="width:60px;height:60px;margin:0 auto 16px;border:1px solid var(--teal-line);display:grid;place-items:center;background:#fff" id="splashMark"></div>
+    <h2 style="font:600 22px var(--serif);letter-spacing:.2em;color:var(--teal-deep)">GRANDMASTER</h2>
+    <p style="color:var(--muted-2);font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;margin-top:10px">Loading your club…</p>
   </div>
 </div>
 
@@ -3897,7 +4109,7 @@ function renderApp() {
             <button class="btn sm" id="btnSendInvite" type="button">Send</button>
           </div>
         </div>
-        <div class="tiny" style="color:#d7bd83;margin-top:9px;line-height:1.55" id="inviteRuleNote">
+        <div class="tiny" style="color:var(--ink-2);margin-top:9px;line-height:1.55;border-left:3px solid var(--teal);background:var(--teal-soft-2);padding:8px 10px" id="inviteRuleNote">
           Invitation rule: if <b>you decline</b> a challenge sent to you, <b>your</b> rating drops by
           <b id="declineRulePoints">10</b> points (never below 0). The player who invited you loses nothing.
           Letting an invitation expire or cancelling your own never costs anything.
@@ -4001,8 +4213,8 @@ function renderApp() {
 
     <aside class="sidepanel">
       <div class="scorebox">
-        <div class="scorecard"><span id="scoreYouLabel">Your captures</span><b id="scoreYou">0</b><span class="tiny" id="scoreYouDetail" style="text-transform:none;letter-spacing:0;color:#9fb3ab">0 pieces captured</span></div>
-        <div class="scorecard"><span id="scoreOppLabel">Their captures</span><b id="scoreOpp">0</b><span class="tiny" id="scoreOppDetail" style="text-transform:none;letter-spacing:0;color:#9fb3ab">0 pieces captured</span></div>
+        <div class="scorecard"><span id="scoreYouLabel">Your captures</span><b id="scoreYou">0</b><span class="tiny" id="scoreYouDetail" style="text-transform:none;letter-spacing:0;color:var(--muted-2)">0 pieces captured</span></div>
+        <div class="scorecard"><span id="scoreOppLabel">Their captures</span><b id="scoreOpp">0</b><span class="tiny" id="scoreOppDetail" style="text-transform:none;letter-spacing:0;color:var(--muted-2)">0 pieces captured</span></div>
       </div>
       <div id="resultSlot"></div>
       <div class="offer-banner" id="drawOfferBanner" hidden>
@@ -4094,8 +4306,33 @@ function renderApp() {
     promo: null, matchmaking: false, lobbyTimer: null,
     resultShown: null, coachOpen: false,
     spectating: false, spectatorCount: 0, chatSeen: {},
-    ring: null, ringing: null, clockDeadline: 0, clockTimer: null
+    ring: null, ringing: null, clockDeadline: 0, clockTimer: null,
+    reauthTried: false, verifying: false
   };
+
+  /* ----------------------------------------------------------- session token
+   * The server also returns a bearer token at sign-in. Keeping it in
+   * localStorage means a sign-in still works when the browser refuses or drops
+   * the session cookie (plain-HTTP production, blocked third-party cookies,
+   * "block all cookies" settings), which used to bounce new players straight
+   * back to the sign-in screen. */
+  var TOKEN_KEY = 'grandmaster.token';
+  var memoryToken = '';
+  function getToken() {
+    if (memoryToken) return memoryToken;
+    try {
+      memoryToken = window.localStorage.getItem(TOKEN_KEY) || '';
+    } catch (err) { memoryToken = ''; }
+    return memoryToken;
+  }
+  function setToken(value) {
+    memoryToken = typeof value === 'string' ? value : '';
+    try {
+      if (memoryToken) window.localStorage.setItem(TOKEN_KEY, memoryToken);
+      else window.localStorage.removeItem(TOKEN_KEY);
+    } catch (err) { /* storage may be blocked — the in-memory copy still works */ }
+  }
+  function clearToken() { setToken(''); }
 
   /* ------------------------------------------------------------------ utils */
   function $(id) { return document.getElementById(id); }
@@ -4145,6 +4382,8 @@ function renderApp() {
   function api(path, options) {
     var opts = options || {};
     var init = { method: opts.method || 'GET', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' } };
+    var token = getToken();
+    if (token) init.headers['x-gm-token'] = token;
     if (opts.body) init.body = JSON.stringify(opts.body);
     return fetch('/api' + path, init).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
@@ -4296,7 +4535,7 @@ function renderApp() {
 
   function connectSocket() {
     if (S.socket || typeof window.io !== 'function') return;
-    var socket = window.io({ withCredentials: true, reconnectionDelay: 800, reconnectionDelayMax: 5000 });
+    var socket = window.io({ withCredentials: true, auth: { token: getToken() }, reconnectionDelay: 800, reconnectionDelayMax: 5000 });
     S.socket = socket;
 
     socket.on('connect', function () {
@@ -4308,7 +4547,22 @@ function renderApp() {
       setConn(false);
       toast('Connection lost', 'Trying to reconnect…', 'error');
     });
-    socket.on('connect_error', function () { setConn(false); });
+    socket.on('connect_error', function (err) {
+      setConn(false);
+      /* A stale token is worth replacing before the user sees anything: ask the
+       * server who we are, then retry the handshake once. */
+      if (err && /unauthenticated/i.test(err.message || '') && !S.reauthTried) {
+        S.reauthTried = true;
+        api('/auth/me')
+          .then(function (res) {
+            S.user = res.user;
+            S.config = res.config || S.config;
+            socket.auth = { token: getToken() };
+            socket.connect();
+          })
+          .catch(function () { S.reauthTried = false; });
+      }
+    });
 
     socket.on('presence:list', function (payload) {
       if (!S.lobby || !payload) return;
@@ -4495,9 +4749,22 @@ function renderApp() {
     setFormMsg(msg, 'Creating your account…', true);
     api('/auth/signup', { method: 'POST', body: payload })
       .then(function (res) {
+        if (res.token) setToken(res.token);
         S.user = res.user;
         S.config = res.config;
-        enterApp(null);
+        setFormMsg(msg, 'Account created. Opening your club…', true);
+        return verifySession(2).then(function (ok) {
+          if (!ok) {
+            /* Keep the credentials out of the way and tell the user exactly what
+             * happened instead of looping them back to an empty form. */
+            setFormMsg(msg, SESSION_LOST_TEXT);
+            switchAuthTab('login');
+            $('loginIdentifier').value = payload.username;
+            return;
+          }
+          S.reauthTried = false;
+          enterApp(null);
+        });
       })
       .catch(function (err) { setFormMsg(msg, err.message); })
       .then(function () { btn.disabled = false; });
@@ -4516,9 +4783,17 @@ function renderApp() {
     setFormMsg(msg, 'Signing in…', true);
     api('/auth/login', { method: 'POST', body: payload })
       .then(function (res) {
+        if (res.token) setToken(res.token);
         S.user = res.user;
         S.config = res.config;
-        enterApp(res.activeGameId || null);
+        return verifySession(2).then(function (ok) {
+          if (!ok) {
+            setFormMsg(msg, SESSION_LOST_TEXT);
+            return;
+          }
+          S.reauthTried = false;
+          enterApp(res.activeGameId || null);
+        });
       })
       .catch(function (err) { setFormMsg(msg, err.message); })
       .then(function () { btn.disabled = false; });
@@ -4528,12 +4803,14 @@ function renderApp() {
     api('/auth/logout', { method: 'POST' })
       .catch(function () { return null; })
       .then(function () {
+        setPath('/');
         if (S.socket) {
           if (S.spectating && S.game) S.socket.emit('spectate:leave', { gameId: S.game.gameId });
           S.socket.close();
           S.socket = null;
         }
         hideChallengeRing();
+        clearToken();
         S.user = null; S.lobby = null; S.game = null;
         S.spectating = false;
         S.clockDeadline = 0;
@@ -4545,9 +4822,51 @@ function renderApp() {
       });
   }
 
+  /**
+   * Confirm the server really recognises this browser before showing the lobby.
+   * A session can be lost even though the sign-up call succeeded (cookie
+   * refused, storage cleared, proxy stripping headers), and silently dropping
+   * the player back on the form is exactly the bug this guards against.
+   */
+  function verifySession(attempts) {
+    var left = attempts == null ? 2 : attempts;
+    return api('/auth/me')
+      .then(function (res) {
+        if (res && res.user) { S.user = res.user; S.config = res.config || S.config; return true; }
+        return false;
+      })
+      .catch(function (err) {
+        if (left > 0 && (!err.status || err.status >= 500)) {
+          return new Promise(function (resolve) { setTimeout(resolve, 350); }).then(function () {
+            return verifySession(left - 1);
+          });
+        }
+        if (left > 0 && err.status === 401) {
+          /* One immediate retry covers a cookie that is still landing. */
+          return new Promise(function (resolve) { setTimeout(resolve, 250); }).then(function () {
+            return verifySession(left - 1);
+          });
+        }
+        return false;
+      });
+  }
+
+  var SESSION_LOST_TEXT =
+    'You are signed in, but this browser did not keep your session. ' +
+    'Enable cookies (or leave private browsing) and try again — your account already exists.';
+
+  /* Keep the address bar in sync with the view so a refresh lands on the right
+   * screen. Always a relative path — never a hardcoded host. */
+  function setPath(path) {
+    try {
+      if (window.location.pathname !== path) window.history.replaceState({ section: path }, '', path);
+    } catch (err) { /* history is optional */ }
+  }
+
   /* ------------------------------------------------------------ lobby views */
   function enterApp(activeGameId) {
     showView('viewLobby');
+    setPath('/lobby');
     connectSocket();
     renderUserChip();
     loadLobby().then(function () {
@@ -4592,12 +4911,21 @@ function renderApp() {
         return data;
       })
       .catch(function (err) {
-        if (err.status === 401) {
-          S.user = null;
-          showView('viewAuth');
-        } else {
+        if (err.status !== 401) {
           toast('Could not refresh the lobby', err.message, 'error');
+          return;
         }
+        /* Do not silently throw the player back to the form — check once more,
+         * then explain what happened. */
+        return verifySession(1).then(function (ok) {
+          if (ok) return loadLobby();
+          S.user = null;
+          clearToken();
+          showView('viewAuth');
+          switchAuthTab('login');
+          setFormMsg($('loginMsg'), SESSION_LOST_TEXT);
+          return null;
+        });
       });
   }
 
@@ -4671,7 +4999,7 @@ function renderApp() {
         '</div>';
     });
     outgoing.forEach(function (inv) {
-      html += '<div class="invite-row" style="border-color:#22453e;background:rgba(0,0,0,.22)">' +
+      html += '<div class="invite-row" style="border-color:var(--line);background:var(--surface-2)">' +
         '<div class="who"><b>To ' + esc(inv.username) + '</b>' +
         '<span class="tiny muted">waiting · <span class="countdown" data-since="' + inv.expiresAt + '">' +
         fmtClock(new Date(inv.expiresAt) - Date.now()) + '</span> left · they pay the price if they decline</span></div>' +
@@ -4694,7 +5022,7 @@ function renderApp() {
       var left = g.clockEndsAt ? Math.max(0, new Date(g.clockEndsAt).getTime() - Date.now()) : 0;
       var tag = g.isMine ? 'your game' : 'live';
       return '<div class="live-row">' +
-        '<div class="vs"><b>' + esc(g.white) + ' <span style="color:#c6a45c">vs</span> ' + esc(g.black) + '</b>' +
+        '<div class="vs"><b>' + esc(g.white) + ' <span style="color:var(--teal-strong)">vs</span> ' + esc(g.black) + '</b>' +
         '<span>' + g.moves + ' plies · captured ' + (g.capturePoints.w + g.capturePoints.b) +
         ' · ' + fmtClock(left) + ' left · ' + tag + '</span></div>' +
         '<div class="meta">' +
@@ -4758,7 +5086,7 @@ function renderApp() {
     box.innerHTML = board.map(function (row) {
       return '<div class="lb-row' + (row.isMe ? ' me' : '') + '">' +
         '<span class="rank">' + row.rank + '</span>' +
-        '<span class="nm">' + esc(row.username) + (row.isMe ? ' <span class="tiny" style="color:#c6a45c">(you)</span>' : '') +
+        '<span class="nm">' + esc(row.username) + (row.isMe ? ' <span class="tiny" style="color:var(--teal-strong)">(you)</span>' : '') +
         '<span class="tiny muted"> ' + row.wins + 'W · ' + row.losses + 'L · ' + row.draws + 'D</span></span>' +
         '<span class="rating-tag">' + row.rating + '</span></div>';
     }).join('');
@@ -5109,10 +5437,12 @@ function renderApp() {
       text = 'Sending your move…';
     } else if (myTurn) {
       text = (g.inCheck ? 'Check! ' : '') + 'Your move';
+      status.className = g.inCheck ? 'status alert' : 'status';
     } else {
       text = (g.inCheck ? 'Check! ' : '') + (g.turn === 'w' ? 'White' : 'Black') + ' to move' +
         (g.mode === 'ai' ? ' · computer thinking…' : '');
-      status.className = 'status alert';
+      /* red is reserved for check/errors in the light theme */
+      status.className = g.inCheck ? 'status alert' : 'status';
     }
     status.textContent = text;
 
@@ -5197,7 +5527,7 @@ function renderApp() {
       '<div class="tiny muted">' + esc(extra) + '</div></div>';
 
     $('resultTitle').textContent = title + ' — ' + reason;
-    $('resultBody').innerHTML = '<p><b style="color:#e7cd92">' + esc(deltaText) + '</b></p>' +
+    $('resultBody').innerHTML = '<p><b style="color:var(--teal-deep)">' + esc(deltaText) + '</b></p>' +
       '<p>' + esc(extra) + '</p>' +
       (state.mode === 'ai'
         ? '<p class="tiny muted">Practice games do not move your rating unless the server operator enables AI_GAMES_AFFECT_RATING.</p>'
@@ -5210,6 +5540,7 @@ function renderApp() {
 
   function openGame(gameId) {
     showView('viewGame');
+    setPath('/game');
     if (!S.socket) {
       showView('viewLobby');
       return;
@@ -5234,6 +5565,7 @@ function renderApp() {
   /* Watch a live match without touching it. */
   function spectateGame(gameId) {
     showView('viewGame');
+    setPath('/game');
     S.spectating = true;
     socketEmit('spectate:join', { gameId: gameId }, function (res) {
       if (!res || !res.ok) {
@@ -5725,7 +6057,21 @@ function renderApp() {
       S.config = res.config;
       enterApp(res.activeGameId || null);
     })
-    .catch(function () {
+    .catch(function (err) {
+      /* Retry once: a cold server or a just-set cookie should not log anyone out. */
+      if (!err || !err.status || err.status >= 500) {
+        setTimeout(function () {
+          api('/auth/me')
+            .then(function (res) {
+              S.user = res.user;
+              S.config = res.config;
+              enterApp(res.activeGameId || null);
+            })
+            .catch(function () { showView('viewAuth'); switchAuthTab('login'); });
+        }, 400);
+        return;
+      }
+      clearToken();
       showView('viewAuth');
       switchAuthTab('login');
     });
@@ -5735,24 +6081,32 @@ function renderApp() {
 </html>`;
 }
 
-/* Every non-API GET renders the app shell (client-side routing). */
-app.get(['/', '/login', '/lobby', '/game'], (req, res) => {
+/* ---------------------------------------------------------------------------
+ * Frontend routing.
+ *
+ * The whole UI is served by this one file, so every navigation — including a
+ * hard refresh on /lobby — must answer with the app shell. The order below is
+ * deliberate:
+ *   1. named shell routes (fast path, no regex),
+ *   2. JSON 404 for anything under /api (so a typo'd endpoint never returns HTML),
+ *   3. the catch-all wildcard, placed LAST before the error handlers.
+ * ------------------------------------------------------------------------- */
+
+function sendAppShell(req, res) {
   res.set('Cache-Control', 'no-store');
   res.type('html').send(renderApp());
-});
-app.use((req, res, next) => {
-  if (req.method === 'GET' && !req.path.startsWith('/api') && req.accepts('html')) {
-    return res.status(200).type('html').send(renderApp());
-  }
-  return next();
-});
+}
+
+app.get(['/', '/login', '/signup', '/lobby', '/game', '/play', '/watch'], sendAppShell);
+
+/* Nothing under /api ever reaches the HTML shell: the api router ends with a
+ * JSON 404 and its auth guard answers 401 for the rest. */
+/* Wildcard fallback for client-side routing (GET/HEAD only, /api excluded). */
+app.get(/^(?!\/api(?:\/|$)).*/, sendAppShell);
 
 /* ---------------------------------------------------------------------------
  * SECTION 12 — ERROR HANDLING, STARTUP, SHUTDOWN
  * ------------------------------------------------------------------------- */
-
-/* 404 for unknown API endpoints. */
-app.use('/api', (req, res) => res.status(404).json({ error: 'Endpoint not found.', code: 'not_found' }));
 
 /* Central error handler: no stack traces or internal details leak in production. */
 app.use((err, req, res, next) => {
@@ -5822,7 +6176,14 @@ async function connectDatabase(connectionUri) {
   });
   const { host, name } = mongoose.connection;
   log(`MongoDB connected — ${host}/${name}`);
-  await Promise.all([User.init(), Game.init(), Invitation.init(), RatingHistory.init(), Notification.init()]);
+  await Promise.all([
+    User.init(),
+    Game.init(),
+    Invitation.init(),
+    RatingHistory.init(),
+    Notification.init(),
+    SessionToken.init(),
+  ]);
   log('Indexes ready.');
 }
 
@@ -5911,7 +6272,18 @@ async function start() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    log(`Grandmaster listening on http://localhost:${PORT} (${NODE_ENV})`);
+    log(`Grandmaster listening on ${PUBLIC_URL || `http://localhost:${PORT}`} (${NODE_ENV}) port ${PORT}`);
+    log(
+      `Auth transport: session cookie (secure=${COOKIE_SECURE === 'auto' ? 'auto — sent only over HTTPS' : COOKIE_SECURE}) ` +
+        `+ bearer-token fallback · trust proxy=${JSON.stringify(TRUST_PROXY_VALUE)}`
+    );
+    if (IS_PROD && COOKIE_SECURE === true && TRUST_PROXY_VALUE === false) {
+      warn(
+        'COOKIE_SECURE=true while no reverse proxy is trusted: if this server is reached over plain HTTP the ' +
+          'browser will refuse the session cookie. Signs of that are players who sign up and stay on the sign-in ' +
+          'screen. Serve over HTTPS (with TRUST_PROXY=1) or set COOKIE_SECURE=auto/false.'
+      );
+    }
     log(
       `Rating model: start ${START_RATING} · capture values ${JSON.stringify(PIECE_VALUES)} · ` +
         `decline penalty ${DECLINE_PENALTY} (paid by the declining player) · forfeit penalty ${FORFEIT_PENALTY} · ` +
